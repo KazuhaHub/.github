@@ -1,0 +1,21 @@
+# Build artifacts
+/reference/safe/safe
+/reference/vulnerable/vulnerable
+*.test
+*.out
+
+# Local scratch
+/tmp/
+*.log
+
+# OS cruft
+.DS_Store
+
+# Generated test fixtures. Regenerated on demand by `go run ./fixtures`
+# (selfcheck.sh does this automatically when they are missing).
+#
+# These are provably test-only keys, but a private key committed to a public
+# repository is permanent and trips secret scanning, so it is cheaper to
+# generate them than to explain them forever.
+fixtures/*.pem
+fixtures/*-metadata.xml
