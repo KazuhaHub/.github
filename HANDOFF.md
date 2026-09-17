@@ -348,3 +348,79 @@ out of scope for the batch.
 - `StockAnalysisPrediction-Report-Portal/docs/adr/0023-sso-saml-oidc.md` — the portal's SSO design.
 - Each PR body carries its own measurements; the security ones carry the failing-test output from
   before the fix.
+
+---
+
+## 11. How this work was done — conventions worth keeping
+
+These are not house style for its own sake. Each one is here because ignoring it cost something
+during this batch.
+
+### 11.1 Method
+
+- **Reproduce before claiming.** Every defect in §5 was demonstrated with a failing test *before* a
+  fix was written, and every "this upstream change does not affect us" was checked against the
+  source rather than the changelog. Two conclusions flipped under that rule: the `goxmldsig`
+  advisory turned out to be invisible to both scanners, and `ratelimit`'s only argument for
+  existing evaporated once the defect behind it was fixed directly.
+- **A test that cannot fail is not a test.** Every fix here was verified by breaking it again and
+  confirming the test goes red — in both directions where the mistake has two sides. `AlertHub#18`
+  has four tests: three fail if `ClientIP` stops honouring the header, one fails if it starts
+  honouring it from an untrusted peer. A guard that only catches under-trusting would have let the
+  more dangerous mistake through.
+- **Check the data layer before writing migration code.** This is the `audit` lesson: AlertHub's
+  `canonicalAudit` hashes `OrgID` as its second field while `authcore/audit.Event` forbids tenant
+  fields, so no amount of adapter code could have bridged it. Finding that in a read-only preflight
+  saved a wasted migration. §8's preflight followed the same shape.
+- **Do not take a subagent's report at face value.** Earlier in this project a subagent reported
+  writing 508 lines across 8 sections; the file on disk had 111 lines and no code. In this batch a
+  triage report named two sites for a hardcoded timeout and there is only one (§9.1), and the
+  `saml` migration report claimed a TTL clamp was "carried over unchanged" when it moved from
+  `now+34min` to `now+30min`. Verify load-bearing numbers yourself.
+- **Record retractions, do not delete them.** `authcore/FRICTION.md` keeps a P0 that turned out to
+  be wrong, with the measurement that disproved it, because the reasoning behind the mistake is
+  worth more than a clean document.
+
+### 11.2 Conventions
+
+- Comments and identifiers in **English**. No AI attribution inside source files.
+- Branch names must not contain `claude` or `codex`.
+- Commit messages end with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`;
+  PR descriptions end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+- **Do not merge without being asked.** Everything in §2 is deliberately left open.
+- **Workflow subagents run on Sonnet.** Pass `model: 'sonnet'` on every `agent()` call — omitting it
+  inherits the session model, which is how two workflows in this batch ran on Opus by accident. Do
+  not kill a running workflow to correct this: resume caches on `(prompt, opts)`, so adding `model`
+  re-runs every agent and loses the finished ones.
+
+### 11.3 Environment traps that cost time here
+
+- **The shell is zsh, not bash.** Unquoted parameters do **not** word-split, so `for r in $repos`
+  silently iterates once — use `repos=(a b c)` and `"${repos[@]}"`. Glob characters must be quoted:
+  `--include='*.go'` and `"…/commits?per_page=1"`, or zsh fails with `no matches found`.
+- **Every Go command needs `GOWORK=off`.**
+- **`git stash` on a clean tree creates nothing**, so a paired `git stash pop` pops whatever was
+  already on the stack — someone else's work. This happened once here, against
+  `Passwall-Sub-Panel`. **That repository currently holds two of the owner's own stashes**
+  (`codex: CI race change before main sync`, `codex: PSP Node docs before main sync`). Leave them
+  alone; check `git stash list` before any pop.
+- **Test durations to plan around:** Report-Portal's `internal/app` takes 140–210s. Passwall-Sub-Panel's
+  web suite needs `--testTimeout=60000` (and often `--maxWorkers`) before its results mean anything
+  — see §9.2.
+- Repositories: `~/Codes/Passwall-Sub-Panel`, `~/Codes/StockAnalysisPrediction-Report-Portal`,
+  `~/Codes/AlertHub`, `~/Codes/authcore`, `~/Codes/kazuhahub-github` (this one, `KazuhaHub/.github`).
+
+### 11.4 `authcore`'s design rules
+
+Breaking these is what turns a shared library into a distributed monolith. From
+`docs/adr/0001-scope-of-authcore.md`:
+
+- **Share mechanism, not policy.** No `User`, `Account`, `Tenant`, `Org`, `Role` or `Principal`
+  types. A caller that needs a tenant supplies an opaque key.
+- **No web framework types** (`gin.`, `echo.`, `fiber.`) in any public signature.
+- **No cross-package imports inside the library.** `passkey` does not import `saml`.
+- Import aliases only on a real collision — when the consuming file's own package name matches the
+  authcore package — and then prefixed, e.g. `authcoregeoip`.
+- A package earns its place by taking over a **nameable class of mistake**, not by line count.
+  `audit` was deleted at +195 lines because it transferred nothing; `passkey` was kept at +181
+  because it moved the responsibility for getting ceremony orchestration right.
