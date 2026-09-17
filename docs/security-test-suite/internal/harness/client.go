@@ -101,6 +101,24 @@ func PostJSON(rawURL string, body any, cookies []*http.Cookie) (*http.Response, 
 	return NewClient().Do(req)
 }
 
+// PostRawJSON posts an already-encoded JSON body verbatim — unlike
+// PostJSON, it never re-marshals its input. This exists for callers that
+// build wire-exact bytes themselves (e.g. internal/authenticator's
+// WebAuthn attestation/assertion responses, whose byte-for-byte shape is
+// the very thing under test) and must not risk a marshal step silently
+// reordering or reformatting them.
+func PostRawJSON(rawURL string, body []byte, cookies []*http.Cookie) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	return NewClient().Do(req)
+}
+
 // DecodeJSON decodes resp.Body into v and closes the body. It is a test
 // helper (takes testing.TB) because a malformed response body is itself a
 // test failure worth reporting with t.Fatalf, not a Go error to thread

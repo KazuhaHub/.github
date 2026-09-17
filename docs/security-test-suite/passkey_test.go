@@ -1,19 +1,33 @@
 // This file covers design doc section 4.2: WebAuthn/passkey
-// ceremony-session handling — challenge replay, ceremony expiry,
-// origin/RP ID validation, user-handle confusion between two concurrent
-// ceremonies, and signature-counter rollback (cloned-authenticator
-// detection).
+// ceremony-session handling — challenge replay, ceremony expiry, RP
+// identity (origin/RP ID) pinning, user-handle confusion between the
+// wire-claimed and the credential's true recorded owner, and
+// signature-counter rollback (cloned-authenticator detection).
 //
-// Every case here targets the ceremony-SESSION protocol layer described
-// in reference/safe/webauthn.go's package doc: the begin/finish challenge
-// exchange each of the three target projects implements on top of
-// go-webauthn/webauthn, which that library's own documentation leaves
-// entirely to the caller. It does not exercise WebAuthn
-// attestation/assertion cryptography (COSE keys, CBOR attestation
-// objects, ECDSA signatures over clientDataJSON) — per this suite's
-// version audit, go-webauthn/webauthn carries zero open advisories across
-// all three target projects, so there is nothing to regression-test
-// there. See reference/safe/webauthn.go for the full reasoning.
+// Every ceremony in this file is a REAL WebAuthn ceremony: the begin step
+// returns go-webauthn/webauthn's actual PublicKeyCredentialCreationOptions
+// / PublicKeyCredentialRequestOptions, and the finish step carries a real
+// CBOR attestationObject (registration) or a real ECDSA signature over
+// authenticatorData‖SHA-256(clientDataJSON) (login), produced by
+// internal/authenticator — a software WebAuthn authenticator with
+// deliberate attack toggles (wrong RP ID, wrong origin, replayed
+// challenge, counter rollback, forged claimed user handle, corrupted
+// signature). This file no longer talks to a simplified, non-standard
+// JSON ceremony protocol; it drives the same wire format
+// go-webauthn/webauthn expects from any real client, which is what makes
+// pointing it at a real target's passkey endpoints (see the "Route
+// alignment" table in README.md) meaningful.
+//
+// go-webauthn/webauthn's own cryptographic correctness (COSE key parsing,
+// ECDSA signature verification, CBOR attestation decoding, …) is
+// deliberately NOT what these test cases probe — per this suite's version
+// audit, it carries zero open advisories across all three target
+// projects, so there is nothing to regression-test there. What every case
+// here targets is the ceremony-SESSION protocol layer each project
+// implements ON TOP of go-webauthn/webauthn (its own docs leave this
+// entirely to the caller) — see reference/safe/webauthn.go's package doc
+// for exactly which behaviors that is and how reference/safe and
+// reference/vulnerable differ on each.
 //
 // Route shapes here match reference/{safe,vulnerable}/webauthn.go
 // (POST /webauthn/begin, POST /webauthn/finish). Pointing SECTEST_BASE_URL
@@ -28,19 +42,20 @@
 // this suite's intentionally unauthenticated reference stubs.
 //
 // Every test in this file is written to pass against reference/safe and
-// FAIL against reference/vulnerable — see the two real runs recorded in
-// this task's report for the actual output of both. None of the six
-// cases required a "version gate" or "needs white-box" placeholder: all
-// six are observable purely from HTTP status codes on a black-box client,
-// including ceremony expiry, which this file resolves to a wait duration
-// either from the target's own declared `expires_in_seconds` (as
-// reference/safe returns) or from an operator-supplied override — see
-// webauthnCeremonyWait below — rather than assuming every project shares
-// the same window (they don't: reference/safe uses 60s, while all three
-// real projects' passkey ceremony sessions use 5 minutes).
+// FAIL against reference/vulnerable — see this task's report for the
+// actual output of both. None of the six cases required a "version gate"
+// or "needs white-box" placeholder: all six are observable purely from
+// HTTP status codes on a black-box client, including ceremony expiry,
+// which this file resolves to a wait duration either from the target's
+// own declared `expires_in_seconds` (as reference/safe returns) or from
+// an operator-supplied override — see webauthnCeremonyWait below — rather
+// than assuming every project shares the same window (they don't:
+// reference/safe uses 60s, while all three real projects' passkey
+// ceremony sessions use 5 minutes).
 package securitytest
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"os"
@@ -48,15 +63,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KazuhaHub/security-test-suite/internal/authenticator"
 	"github.com/KazuhaHub/security-test-suite/internal/harness"
 )
 
-// Values the reference stubs hardcode as the "correct" origin/RP ID for
-// their single simulated relying party (see reference/safe/webauthn.go's
-// expectedOrigin/expectedRPID). "Wrong" values below use other RFC
+// Values the reference stubs use as the "correct" RP ID/origin for their
+// single simulated relying party (see reference/safe/webauthn.go's
+// expectedRPID/expectedOrigin). "Wrong" values below use other RFC
 // 2606-reserved example domains, never a real one, precisely so the
-// mismatch tests exercise real origin/RP-ID comparisons instead of
-// tautologically matching whatever the target happens to expect.
+// mismatch tests exercise real go-webauthn/webauthn RP-identity
+// validation instead of tautologically matching whatever the target
+// happens to expect. wrongOrigin also has to match
+// reference/vulnerable/webauthn.go's own wrongOrigin constant exactly —
+// see that file's doc comment for why.
 const (
 	webauthnTestOrigin  = "https://example.com"
 	webauthnTestRPID    = "example.com"
@@ -66,38 +85,48 @@ const (
 
 // webauthnCeremonyTTLEnvVar overrides the wait duration
 // TestPasskey_CeremonyExpiryRejected uses, for pointing this suite at a
-// real project whose declared ceremony TTL isn't observable via the
-// begin response body the way reference/safe's is (it returns
+// real project whose declared ceremony TTL isn't observable via the begin
+// response body the way reference/safe's is (it returns
 // expires_in_seconds; a real project's begin response may not). Per the
 // design doc's own note that the three projects' declared expiry windows
 // are themselves a piece of data this suite is supposed to surface, this
 // suite does not hardcode one project's TTL as if it were universal.
 const webauthnCeremonyTTLEnvVar = "SECTEST_WEBAUTHN_CEREMONY_TTL_SECONDS"
 
+// webauthnBeginReq is what this file POSTs to /webauthn/begin. RPID is an
+// optional target-RP-ID override: reference/safe never reads it (its
+// ceremonies are always bound to its own, fixed RP identity);
+// reference/vulnerable honors it (GAP 3) — see that file's doc comment on
+// webauthnBeginRequest.RPID for why that is a realistic vulnerability
+// class and not an artificial hook.
 type webauthnBeginReq struct {
 	Mode         string `json:"mode"`
-	Username     string `json:"username"`
-	CredentialID string `json:"credential_id"`
+	Username     string `json:"username,omitempty"`
+	CredentialID string `json:"credential_id,omitempty"` // base64url, required for mode=login
+	RPID         string `json:"rp_id,omitempty"`
 }
 
+// webauthnBeginResp decodes the union of what a register-begin and a
+// login-begin response carry. Only the fields a given ceremony mode
+// populates are non-zero; register uses PublicKey.RP.ID and
+// PublicKey.User.ID, login uses PublicKey.RPID.
 type webauthnBeginResp struct {
-	Challenge       string `json:"challenge"`
-	RPID            string `json:"rp_id"`
-	UserHandle      string `json:"user_handle"` // base64, the ceremony's server-recorded owner
-	ExpiresInSecond int    `json:"expires_in_seconds"`
-}
-
-type webauthnFinishReq struct {
-	CredentialID string `json:"credential_id"`
-	Counter      uint64 `json:"counter"`
-	Origin       string `json:"origin"`
-	RPID         string `json:"rp_id"`
-	UserHandle   string `json:"user_handle"` // base64, CLIENT-claimed — attacker-controlled input
+	PublicKey struct {
+		Challenge string `json:"challenge"`
+		RP        struct {
+			ID string `json:"id"`
+		} `json:"rp"`
+		RPID string `json:"rpId"`
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	} `json:"publicKey"`
+	ExpiresInSecond int `json:"expires_in_seconds"`
 }
 
 type webauthnFinishResp struct {
 	OK           bool   `json:"ok"`
-	CredentialID string `json:"credential_id"`
+	CredentialID string `json:"credential_id"` // base64url
 }
 
 // webauthnBeginRaw posts a begin request and returns the raw response
@@ -111,11 +140,16 @@ func webauthnBeginRaw(t *testing.T, base string, req webauthnBeginReq) (*http.Re
 	return resp, resp.Cookies()
 }
 
-// webauthnFinishRaw posts a finish request carrying the ceremony cookies
-// captured from the matching begin call.
-func webauthnFinishRaw(t *testing.T, base string, req webauthnFinishReq, cookies []*http.Cookie) *http.Response {
+// webauthnFinishRaw posts a real, already wire-encoded finish body (from
+// an internal/authenticator RegistrationResult/AssertionResult) carrying
+// the ceremony cookies captured from the matching begin call. Unlike a
+// typed POST, this never re-marshals body — the exact bytes
+// internal/authenticator produced are what has to reach the target,
+// since those bytes (the CBOR attestation object or the ECDSA signature)
+// are themselves what is under test.
+func webauthnFinishRaw(t *testing.T, base string, body []byte, cookies []*http.Cookie) *http.Response {
 	t.Helper()
-	resp, err := harness.PostJSON(base+"/webauthn/finish", req, cookies)
+	resp, err := harness.PostRawJSON(base+"/webauthn/finish", body, cookies)
 	return harness.RequireReachable(t, resp, err, "webauthn finish")
 }
 
@@ -150,6 +184,18 @@ func requireWebauthnFinishOK(t *testing.T, resp *http.Response, what string) web
 	return body
 }
 
+// decodeB64URL base64url-decodes a wire value from a begin/finish
+// response, failing the test (fixture problem, not something under test)
+// if the target's own response is malformed.
+func decodeB64URL(t *testing.T, value, what string) []byte {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		t.Fatalf("%s: %q is not valid base64url: %v", what, value, err)
+	}
+	return raw
+}
+
 var webauthnUsernameSeq int
 
 // uniquePasskeyUsername returns a fresh test username per call. The
@@ -161,6 +207,60 @@ var webauthnUsernameSeq int
 func uniquePasskeyUsername(tag string) string {
 	webauthnUsernameSeq++
 	return fmt.Sprintf("sectest-passkey-%s-%d-%d", tag, time.Now().UnixNano(), webauthnUsernameSeq)
+}
+
+// newTestAuthenticator returns a fresh software WebAuthn authenticator
+// (internal/authenticator) for one test case. Each test gets its own so
+// that one test's registered credentials never leak into another's.
+func newTestAuthenticator(t *testing.T) *authenticator.Authenticator {
+	t.Helper()
+	auth, err := authenticator.New()
+	if err != nil {
+		t.Fatalf("construct software authenticator: %v", err)
+	}
+	return auth
+}
+
+// registerCeremony drives a full registration ceremony's client/
+// authenticator half: it decodes the begin response's challenge and user
+// handle and asks auth to produce the finish body, binding the ceremony
+// to rpID/origin (which a caller deliberately mismatches against what
+// begin actually declared, for the RP-identity test cases; every other
+// caller passes webauthnTestRPID/webauthnTestOrigin, i.e. behaves
+// honestly).
+func registerCeremony(t *testing.T, auth *authenticator.Authenticator, begin webauthnBeginResp, rpID, origin string, opts ...authenticator.Option) *authenticator.RegistrationResult {
+	t.Helper()
+	challenge := decodeB64URL(t, begin.PublicKey.Challenge, "begin response challenge")
+	userHandle := decodeB64URL(t, begin.PublicKey.User.ID, "begin response user handle")
+
+	reg, err := auth.Register(authenticator.RegistrationInput{
+		RPID:       rpID,
+		Origin:     origin,
+		Challenge:  challenge,
+		UserHandle: userHandle,
+	}, opts...)
+	if err != nil {
+		t.Fatalf("authenticator: register: %v", err)
+	}
+	return reg
+}
+
+// authenticateCeremony is registerCeremony's counterpart for a login
+// ceremony's client/authenticator half.
+func authenticateCeremony(t *testing.T, auth *authenticator.Authenticator, begin webauthnBeginResp, credentialID []byte, rpID, origin string, opts ...authenticator.Option) *authenticator.AssertionResult {
+	t.Helper()
+	challenge := decodeB64URL(t, begin.PublicKey.Challenge, "begin response challenge")
+
+	asrt, err := auth.Authenticate(authenticator.AssertionInput{
+		RPID:         rpID,
+		Origin:       origin,
+		Challenge:    challenge,
+		CredentialID: credentialID,
+	}, opts...)
+	if err != nil {
+		t.Fatalf("authenticator: authenticate: %v", err)
+	}
+	return asrt
 }
 
 // webauthnCeremonyWait decides how long TestPasskey_CeremonyExpiryRejected
@@ -192,42 +292,43 @@ func webauthnCeremonyWait(t *testing.T, declaredSeconds int) time.Duration {
 	return 60*time.Second + 2*time.Second
 }
 
-// TestPasskey_ChallengeReplayRejected replays the exact same
-// ceremony-finish payload twice against the same begin challenge. The
-// ceremony session must be single-use: GAP 1 in
-// reference/vulnerable/webauthn.go never marks a ceremony used, so the
-// identical finish call succeeds a second time there.
+// TestPasskey_ChallengeReplayRejected replays the exact same, real
+// ceremony-finish payload (the identical CBOR attestationObject and
+// clientDataJSON bytes an honest client would have sent exactly once)
+// twice against the same begin challenge. The ceremony session must be
+// single-use: GAP 1 in reference/vulnerable/webauthn.go never marks a
+// ceremony used, so the identical finish call succeeds a second time
+// there.
 func TestPasskey_ChallengeReplayRejected(t *testing.T) {
 	base := harness.MustBaseURL(t)
 	username := uniquePasskeyUsername("replay")
+	auth := newTestAuthenticator(t)
 
 	beginResp, cookies := webauthnBeginRaw(t, base, webauthnBeginReq{
 		Mode:     "register",
 		Username: username,
 	})
-	requireWebauthnBeginOK(t, beginResp, "challenge-replay setup")
+	begin := requireWebauthnBeginOK(t, beginResp, "challenge-replay setup")
 
-	finishReq := webauthnFinishReq{
-		Counter: 1,
-		Origin:  webauthnTestOrigin,
-		RPID:    webauthnTestRPID,
-	}
+	reg := registerCeremony(t, auth, begin, webauthnTestRPID, webauthnTestOrigin)
 
-	first := webauthnFinishRaw(t, base, finishReq, cookies)
+	first := webauthnFinishRaw(t, base, reg.Body, cookies)
 	requireWebauthnFinishOK(t, first, "baseline registration")
 
-	second := webauthnFinishRaw(t, base, finishReq, cookies)
+	second := webauthnFinishRaw(t, base, reg.Body, cookies)
 	harness.AssertRejected(t, second, nil,
 		"replaying the identical ceremony-finish payload against the same begin challenge")
 }
 
-// TestPasskey_CeremonyExpiryRejected begins a ceremony, waits past its
-// declared (or configured) TTL, and then attempts to finish it. GAP 2 in
-// reference/vulnerable/webauthn.go never records when a ceremony was
-// created, so nothing there is ever "too old" to finish.
+// TestPasskey_CeremonyExpiryRejected begins a ceremony, builds its (valid)
+// finish payload immediately, waits past the ceremony's declared (or
+// configured) TTL, and only then submits that still-otherwise-valid
+// payload. GAP 2 in reference/vulnerable/webauthn.go never records when a
+// ceremony was created, so nothing there is ever "too old" to finish.
 func TestPasskey_CeremonyExpiryRejected(t *testing.T) {
 	base := harness.MustBaseURL(t)
 	username := uniquePasskeyUsername("expiry")
+	auth := newTestAuthenticator(t)
 
 	beginResp, cookies := webauthnBeginRaw(t, base, webauthnBeginReq{
 		Mode:     "register",
@@ -235,158 +336,164 @@ func TestPasskey_CeremonyExpiryRejected(t *testing.T) {
 	})
 	begin := requireWebauthnBeginOK(t, beginResp, "expiry setup")
 
+	reg := registerCeremony(t, auth, begin, webauthnTestRPID, webauthnTestOrigin)
+
 	wait := webauthnCeremonyWait(t, begin.ExpiresInSecond)
 	t.Logf("waiting %s for the ceremony session to age past its TTL before attempting finish", wait)
 	time.Sleep(wait)
 
-	finishResp := webauthnFinishRaw(t, base, webauthnFinishReq{
-		Counter: 1,
-		Origin:  webauthnTestOrigin,
-		RPID:    webauthnTestRPID,
-	}, cookies)
+	finishResp := webauthnFinishRaw(t, base, reg.Body, cookies)
 	harness.AssertRejected(t, finishResp, nil, "finishing a ceremony after its TTL has elapsed")
 }
 
-// TestPasskey_OriginMismatchRejected finishes a ceremony claiming an
-// origin different from the one it was issued for. GAP 3 in
-// reference/vulnerable/webauthn.go reads req.Origin but never compares
-// it against anything.
+// TestPasskey_OriginMismatchRejected finishes a ceremony with a real,
+// correctly signed attestation object whose clientDataJSON nonetheless
+// declares a different origin than the one this ceremony's Relying Party
+// actually serves — the wire-accurate equivalent of a phished or
+// compromised client completing the ceremony from attacker.example.net.
+// reference/safe's relying-party config accepts only webauthnTestOrigin;
+// reference/vulnerable's accepts webauthnWrongOrigin too (GAP 3's origin
+// half — see that file's wrongOrigin doc comment).
 func TestPasskey_OriginMismatchRejected(t *testing.T) {
 	base := harness.MustBaseURL(t)
 	username := uniquePasskeyUsername("origin")
+	auth := newTestAuthenticator(t)
 
 	beginResp, cookies := webauthnBeginRaw(t, base, webauthnBeginReq{
 		Mode:     "register",
 		Username: username,
 	})
-	requireWebauthnBeginOK(t, beginResp, "origin-mismatch setup")
+	begin := requireWebauthnBeginOK(t, beginResp, "origin-mismatch setup")
 
-	finishResp := webauthnFinishRaw(t, base, webauthnFinishReq{
-		Counter: 1,
-		Origin:  webauthnWrongOrigin, // not webauthnTestOrigin — the ceremony's real origin
-		RPID:    webauthnTestRPID,
-	}, cookies)
+	reg := registerCeremony(t, auth, begin, webauthnTestRPID, webauthnWrongOrigin) // not webauthnTestOrigin
+
+	finishResp := webauthnFinishRaw(t, base, reg.Body, cookies)
 	harness.AssertRejected(t, finishResp, nil, "finish claiming an origin the ceremony was not issued for")
 }
 
 // TestPasskey_RPIDMismatchRejected is TestPasskey_OriginMismatchRejected's
-// counterpart for the RP ID field. Same GAP 3, second half of the check
-// reference/vulnerable/webauthn.go never performs.
+// counterpart for the RP ID half of GAP 3. Unlike origin, go-webauthn
+// pins a ceremony's expected RP ID from its BEGIN step permanently into
+// the session (SessionData.RelyingPartyID always wins over whatever a
+// finish call's own data might claim), so the only way to reach a
+// "wrong RP ID accepted" outcome is to let begin() bind the ceremony to a
+// non-default RP ID in the first place — which is exactly what this test
+// asks for via webauthnBeginReq.RPID.
+// reference/safe's begin handler ignores that field outright;
+// reference/vulnerable's honors it.
 func TestPasskey_RPIDMismatchRejected(t *testing.T) {
 	base := harness.MustBaseURL(t)
 	username := uniquePasskeyUsername("rpid")
+	auth := newTestAuthenticator(t)
 
 	beginResp, cookies := webauthnBeginRaw(t, base, webauthnBeginReq{
 		Mode:     "register",
 		Username: username,
+		RPID:     webauthnWrongRPID, // honored only by reference/vulnerable
 	})
-	requireWebauthnBeginOK(t, beginResp, "rp-id-mismatch setup")
+	begin := requireWebauthnBeginOK(t, beginResp, "rp-id-mismatch setup")
 
-	finishResp := webauthnFinishRaw(t, base, webauthnFinishReq{
-		Counter: 1,
-		Origin:  webauthnTestOrigin,
-		RPID:    webauthnWrongRPID, // not webauthnTestRPID — the ceremony's real RP ID
-	}, cookies)
+	// The authenticator signs for whatever RP ID the (possibly malicious)
+	// begin response bound the ceremony to — self-consistent with what
+	// was actually requested, isolating this test to whether the target
+	// should ever have let a caller pick that RP ID at all.
+	reg := registerCeremony(t, auth, begin, webauthnWrongRPID, webauthnTestOrigin)
+
+	finishResp := webauthnFinishRaw(t, base, reg.Body, cookies)
 	harness.AssertRejected(t, finishResp, nil, "finish claiming an RP ID the ceremony was not issued for")
 }
 
 // TestPasskey_UserHandleConfusionRejected completes user B's login
-// ceremony while claiming user A's user_handle — "用 A 的 handle 完成 B 的
-// ceremony" from the design doc's 4.2 table. A's handle is obtained
-// legitimately (A's own register-begin response, exactly what A's own
-// client would see), not derived by reversing the stub's hashing scheme:
-// the point is to test whether the target checks the claimed handle
-// against the ceremony's true, server-recorded owner, not to exploit an
-// implementation detail of how that owner is computed.
+// ceremony with a cryptographically VALID assertion — signed by B's own
+// registered credential, over B's own real challenge — that nonetheless
+// claims user A's user_handle in its wire-level userHandle field. A's
+// handle is harvested from A's own register-begin response (exactly what
+// A's own client would see), not derived by reversing the stub's hashing
+// scheme: the point is to test whether the target checks the claimed
+// handle against the ceremony's true, server-recorded owner, not to
+// exploit an implementation detail of how that owner is computed.
 //
-// GAP 4 in reference/vulnerable/webauthn.go only ever falls back to the
-// client-claimed handle when the ceremony has NO recorded owner; here the
-// ceremony DOES have one (B, via a known credential_id), so the bug this
-// test actually reaches is narrower but still real: the vulnerable finish
-// handler accepts (200) a finish call whose claimed identity contradicts
-// the ceremony's own record, instead of rejecting it the way
-// reference/safe does.
+// go-webauthn/webauthn's own ValidatePasskeyLogin rejects a claimed
+// userHandle that doesn't match the identity the caller's
+// DiscoverableUserHandler resolves — reference/safe's handler resolves
+// that identity from the credential's true recorded owner (rawID), so
+// this mismatch is a real rejection there. reference/vulnerable's handler
+// resolves identity from the CLAIMED handle instead (GAP 4), which makes
+// the check tautologically pass while still using B's genuine credential
+// (and therefore a genuinely valid signature) to do it.
 func TestPasskey_UserHandleConfusionRejected(t *testing.T) {
 	base := harness.MustBaseURL(t)
 	userA := uniquePasskeyUsername("handle-confusion-a")
 	userB := uniquePasskeyUsername("handle-confusion-b")
+	auth := newTestAuthenticator(t)
 
 	// Harvest A's own user_handle from A's own register-begin response —
 	// this is what A's own client legitimately observes, not a value
-	// derived from B's ceremony.
+	// derived from B's ceremony. A's registration is never completed.
 	aBeginResp, _ := webauthnBeginRaw(t, base, webauthnBeginReq{Mode: "register", Username: userA})
 	aBegin := requireWebauthnBeginOK(t, aBeginResp, "user A handle harvest")
-	if aBegin.UserHandle == "" {
-		t.Fatalf("user A's register-begin response did not include a user_handle, cannot construct the attack input")
-	}
+	aUserHandle := decodeB64URL(t, aBegin.PublicKey.User.ID, "user A's user handle")
 
 	// Register B for real, so a subsequent login ceremony against B's
 	// credential_id is legitimate on both stubs.
 	bBeginResp, bRegCookies := webauthnBeginRaw(t, base, webauthnBeginReq{Mode: "register", Username: userB})
-	requireWebauthnBeginOK(t, bBeginResp, "user B registration begin")
-	bFinishResp := webauthnFinishRaw(t, base, webauthnFinishReq{
-		Counter: 1,
-		Origin:  webauthnTestOrigin,
-		RPID:    webauthnTestRPID,
-	}, bRegCookies)
-	bReg := requireWebauthnFinishOK(t, bFinishResp, "user B registration finish")
+	bBegin := requireWebauthnBeginOK(t, bBeginResp, "user B registration begin")
+	bReg := registerCeremony(t, auth, bBegin, webauthnTestRPID, webauthnTestOrigin)
+	bFinishResp := webauthnFinishRaw(t, base, bReg.Body, bRegCookies)
+	bFinish := requireWebauthnFinishOK(t, bFinishResp, "user B registration finish")
+	bCredentialID := decodeB64URL(t, bFinish.CredentialID, "user B's credential ID")
 
 	// Begin a LOGIN ceremony against B's own credential — the ceremony is
 	// legitimately bound to B, server-side, at this point.
 	loginBeginResp, loginCookies := webauthnBeginRaw(t, base, webauthnBeginReq{
 		Mode:         "login",
-		CredentialID: bReg.CredentialID,
+		CredentialID: bFinish.CredentialID,
 	})
-	requireWebauthnBeginOK(t, loginBeginResp, "user B login begin")
+	loginBegin := requireWebauthnBeginOK(t, loginBeginResp, "user B login begin")
 
-	// Finish B's ceremony while claiming A's user_handle, and a counter
-	// that clears the (unrelated) rollback check so this test isolates
-	// the handle check specifically.
-	loginFinishResp := webauthnFinishRaw(t, base, webauthnFinishReq{
-		CredentialID: bReg.CredentialID,
-		Counter:      2, // > the 1 stored at registration
-		Origin:       webauthnTestOrigin,
-		RPID:         webauthnTestRPID,
-		UserHandle:   aBegin.UserHandle, // attacker-claimed: A, not B
-	}, loginCookies)
+	// Sign a genuinely valid assertion with B's own credential, but claim
+	// A's user_handle instead of the one this authenticator actually
+	// recorded for B at registration.
+	asrt := authenticateCeremony(t, auth, loginBegin, bCredentialID, webauthnTestRPID, webauthnTestOrigin,
+		authenticator.WithUserHandle(aUserHandle))
+
+	loginFinishResp := webauthnFinishRaw(t, base, asrt.Body, loginCookies)
 	harness.AssertRejected(t, loginFinishResp, nil,
 		"finishing user B's login ceremony while claiming user A's user_handle")
 }
 
-// TestPasskey_CounterRollbackRejected registers a credential with a given
-// signature counter, then completes a login ceremony against that same
-// credential with a LOWER counter — the standard signal a physical
-// authenticator was cloned. The correct (true) user_handle is used so
-// this test isolates the counter check from the handle check covered by
-// TestPasskey_UserHandleConfusionRejected. GAP 5 in
-// reference/vulnerable/webauthn.go stores whatever counter it's given,
-// unconditionally.
+// TestPasskey_CounterRollbackRejected registers a credential whose
+// authenticator data reports a given signature counter, then completes a
+// login ceremony against that same credential with a genuinely valid
+// signature but a LOWER counter — the standard signal a physical
+// authenticator was cloned. go-webauthn/webauthn itself only flags this
+// (Credential.Authenticator.CloneWarning), never rejects it outright,
+// leaving the accept/reject decision to the caller by design — see
+// reference/safe/webauthn.go's package doc. reference/safe checks the
+// flag and rejects; reference/vulnerable (GAP 5) never looks at it.
 func TestPasskey_CounterRollbackRejected(t *testing.T) {
 	base := harness.MustBaseURL(t)
 	username := uniquePasskeyUsername("counter-rollback")
+	auth := newTestAuthenticator(t)
 
 	regBeginResp, regCookies := webauthnBeginRaw(t, base, webauthnBeginReq{Mode: "register", Username: username})
-	requireWebauthnBeginOK(t, regBeginResp, "registration begin")
-	regFinishResp := webauthnFinishRaw(t, base, webauthnFinishReq{
-		Counter: 5,
-		Origin:  webauthnTestOrigin,
-		RPID:    webauthnTestRPID,
-	}, regCookies)
-	reg := requireWebauthnFinishOK(t, regFinishResp, "registration finish (counter=5)")
+	regBegin := requireWebauthnBeginOK(t, regBeginResp, "registration begin")
+	reg := registerCeremony(t, auth, regBegin, webauthnTestRPID, webauthnTestOrigin, authenticator.WithCounter(5))
+
+	regFinishResp := webauthnFinishRaw(t, base, reg.Body, regCookies)
+	regFinish := requireWebauthnFinishOK(t, regFinishResp, "registration finish (counter=5)")
+	credentialID := decodeB64URL(t, regFinish.CredentialID, "registered credential ID")
 
 	loginBeginResp, loginCookies := webauthnBeginRaw(t, base, webauthnBeginReq{
 		Mode:         "login",
-		CredentialID: reg.CredentialID,
+		CredentialID: regFinish.CredentialID,
 	})
 	loginBegin := requireWebauthnBeginOK(t, loginBeginResp, "login begin")
 
-	loginFinishResp := webauthnFinishRaw(t, base, webauthnFinishReq{
-		CredentialID: reg.CredentialID,
-		Counter:      3, // < 5 — a signature counter that went BACKWARDS
-		Origin:       webauthnTestOrigin,
-		RPID:         webauthnTestRPID,
-		UserHandle:   loginBegin.UserHandle, // correct owner, isolates this test to the counter check
-	}, loginCookies)
+	asrt := authenticateCeremony(t, auth, loginBegin, credentialID, webauthnTestRPID, webauthnTestOrigin,
+		authenticator.WithCounter(3)) // < 5 — a signature counter that went BACKWARDS
+
+	loginFinishResp := webauthnFinishRaw(t, base, asrt.Body, loginCookies)
 	harness.AssertRejected(t, loginFinishResp, nil,
 		"finishing a login ceremony whose signature counter (3) is lower than the credential's last recorded counter (5)")
 }
