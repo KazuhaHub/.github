@@ -21,6 +21,7 @@ HTTP, exactly as an external attacker would.
 ```
 go.mod                      independent module, github.com/KazuhaHub/security-test-suite
 internal/harness/           shared HTTP plumbing every *_test.go file uses
+internal/authenticator/     a real software WebAuthn authenticator + attack toggles, used by passkey_test.go
 fixtures/                   TEST ONLY SAML IdP key/cert + metadata, regenerable
 reference/safe/             a minimal, CORRECT reference implementation
 reference/vulnerable/       the same route shapes, each protection removed on purpose
@@ -84,12 +85,18 @@ bottom for the full, numbered list — the short version:
   signature requirement (CVE-2022-41912 shape); ignores
   `NotBefore`/`NotOnOrAfter`; no assertion-ID replay cache; unbounded
   deflate decompression on the Redirect binding (CVE-2023-28119 shape).
-- **WebAuthn ceremony**: no single-use enforcement (`finish` replays
-  freely); no expiry; origin and RP ID are read but never compared; a
-  login ceremony trusts the client-claimed `user_handle` instead of the
-  server's own record of the credential's owner; a lower/equal signature
-  counter is accepted instead of flagged as a possible cloned
-  authenticator.
+- **WebAuthn ceremony**: both stubs perform REAL go-webauthn/webauthn
+  ceremonies (see "WebAuthn" under Library choices below) — the gaps are
+  entirely in the ceremony-session layer each stub implements on top of
+  it, not in any hand-rolled crypto. `reference/vulnerable`: no
+  single-use enforcement (`finish` replays freely); no expiry; its
+  relying-party config accepts a second, wrong origin, and its begin
+  handler lets the caller dictate a non-default RP ID (`rp_id` in the
+  begin request) instead of pinning one fixed identity; a login
+  ceremony's `DiscoverableUserHandler` resolves identity from the
+  assertion's wire-level claimed `userHandle` instead of the credential's
+  true recorded owner; go-webauthn's own `CloneWarning` signal (set when
+  a signature counter fails to increase) is computed but never checked.
 - **OIDC**: the callback looks a flow up **by authorization code alone**,
   so `state` is never actually required to match anything; the code is
   never invalidated after one use; the id_token's signature, `alg`,
@@ -115,17 +122,29 @@ bottom for the full, numbered list — the short version:
 - **OIDC**: `github.com/golang-jwt/jwt/v5`, with `jwt.WithValidMethods`
   pinned to `RS256` — this is what makes `alg=none` (and any other
   algorithm) rejected by construction, not by an ad hoc string check.
-- **WebAuthn**: deliberately **no** `go-webauthn/webauthn` dependency, and
-  no COSE/CBOR/attestation cryptography at all. Per the design doc's
-  version audit, `go-webauthn/webauthn` carries zero open advisories
-  across all three target projects — there is nothing to regression-test
-  there, and that library's own docs say the ceremony-*session* handling
-  (challenge single-use, expiry, origin/RP ID checks, user-handle
-  ownership, counter-rollback detection) is entirely the caller's
-  responsibility. That is exactly the surface every 4.2 test case probes,
-  so `reference/{safe,vulnerable}/webauthn.go` implement a focused
-  simulation of just that protocol layer. See the package doc at the top
-  of `reference/safe/webauthn.go` for the full reasoning.
+- **WebAuthn**: `github.com/go-webauthn/webauthn` v0.18.1, pinned newer
+  than any of the three target projects' current `v0.17.4`. Both
+  reference stubs are REAL relying parties built on it —
+  `webauthn.WebAuthn.BeginRegistration` / `FinishRegistration` /
+  `BeginDiscoverableLogin` / `FinishPasskeyLogin` — and every finish call
+  in `passkey_test.go` carries a real CBOR attestationObject or a real
+  ECDSA (ES256) signature over `authenticatorData‖SHA-256(clientDataJSON)`,
+  produced by `internal/authenticator` (a software WebAuthn
+  authenticator; CBOR via `github.com/fxamacker/cbor/v2`, the same
+  library go-webauthn itself depends on for the purpose). Per the design
+  doc's version audit, go-webauthn's own cryptographic correctness (COSE
+  key parsing, ECDSA/attestation verification, CBOR decoding) carries
+  zero open advisories across all three target projects — there is
+  nothing to regression-test there, and that library's own docs say the
+  ceremony-*session* handling (challenge single-use, expiry, RP-identity
+  pinning, user-handle ownership, counter-rollback detection) is entirely
+  the caller's responsibility. That is exactly the surface every 4.2 test
+  case probes; `reference/{safe,vulnerable}/webauthn.go` differ only in
+  that layer, never in how they call go-webauthn itself. See the package
+  doc at the top of `reference/safe/webauthn.go` for the full reasoning,
+  and `internal/authenticator/doc.go` for the authenticator's own attack
+  toggles (forged RP ID/origin/challenge/counter/user-handle/UP/UV flags,
+  corrupted signatures).
 
 ## `internal/harness`
 
@@ -140,6 +159,10 @@ to use:
 - `harness.PostSAMLResponse(acsURL, samlResponseXML, relayState) (*http.Response, error)`
 - `harness.GetWithCookies(url, cookies, headers) (*http.Response, error)`
 - `harness.PostJSON(url, body, cookies) (*http.Response, error)`
+- `harness.PostRawJSON(url, rawBody []byte, cookies) (*http.Response, error)`
+  — posts already-encoded bytes verbatim, never re-marshaling; used for
+  `internal/authenticator`'s wire-exact WebAuthn finish payloads, whose
+  byte-for-byte shape is itself under test.
 - `harness.DecodeJSON(t, resp, v)`
 - `harness.RequireReachable(t, resp, err, what) *http.Response` /
   `harness.AssertRejected(t, resp, err, what)` /
@@ -252,6 +275,14 @@ required to discriminate the two stubs:
   instance (`reference/safe -trusted-proxies=127.0.0.1/32,::1/128`) and
   `SECTEST_TRUSTED_PROXY_BASE_URL`; see `start_stub`'s third invocation
   there. Expected: **PASS on both**.
+- `*_SelfTest` — `internal/authenticator`'s own unit tests
+  (`authenticator_test.go`), which verify that package's WebAuthn wire
+  encoding and ECDSA signing against a real, in-process
+  `go-webauthn/webauthn` relying party the test itself constructs. They
+  never read `SECTEST_BASE_URL` and so cannot distinguish
+  `reference/safe` from `reference/vulnerable` — they exist to prove
+  `internal/authenticator` itself is correct, which every `TestPasskey_*`
+  case in `passkey_test.go` depends on. Expected: **PASS on both**.
 
 Every other test case must **PASS against safe and FAIL against
 vulnerable**. Anything else — passes both, fails against safe, or skips
@@ -265,6 +296,14 @@ it as such.
 | TestAudit_AnchorSemantics_NeedsWhiteBox | SKIP | SKIP | gate (needs white-box, by design) |
 | TestAudit_DeletedEntryBreaksChain_NeedsWhiteBox | SKIP | SKIP | gate (needs white-box, by design) |
 | TestAudit_NormalChainThenTamperedMiddleEntryDetected | PASS | FAIL | yes — discriminates |
+| TestAuthenticateAcceptedByGoWebAuthn_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestAuthenticate_ClaimedUserHandleMismatchRejected_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestAuthenticate_CorruptSignatureRejected_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestAuthenticate_CounterRollbackFlaggedAsCloneWarning_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestAuthenticate_ForgedFlagsAreNotByThemselvesDetectable_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestAuthenticate_ReplayedChallengeRejected_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestAuthenticate_WrongOriginRejected_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestAuthenticate_WrongRPIDRejected_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
 | TestOIDC_AlgNoneForgedTokenRejected | PASS | FAIL | yes — discriminates |
 | TestOIDC_AudienceMismatchRejected | PASS | FAIL | yes — discriminates |
 | TestOIDC_AuthorizationCodeReplayRejected | PASS | FAIL | yes — discriminates |
@@ -282,6 +321,8 @@ it as such.
 | TestPasskey_UserHandleConfusionRejected | PASS | FAIL | yes — discriminates |
 | TestRateLimit_TrustedProxyXFFHonoredGate | PASS | PASS | gate (config-dependent check, by design) |
 | TestRateLimit_XFFTrustBoundary (3 subtests) | PASS | FAIL | yes — discriminates |
+| TestRegisterAcceptedByGoWebAuthn_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
+| TestRegister_WrongRPIDRejected_SelfTest | PASS | PASS | gate (authenticator package self-test, by design) |
 | TestSAML_ConcurrentReplayOnlyOneSucceeds | PASS | FAIL | yes — discriminates |
 | TestSAML_DeflateBombRejected | PASS | FAIL | yes — discriminates |
 | TestSAML_GoxmldsigVersionGate | PASS | PASS | gate (manual check, by design) |
@@ -290,14 +331,17 @@ it as such.
 | TestSAML_ReplaySameAssertionRejected | PASS | FAIL | yes — discriminates |
 | TestSAML_XMLRoundTripVersionGate | PASS | PASS | gate (manual check, by design) |
 
-27 top-level test cases: **22 discriminate** (green on safe, red on
+37 top-level test cases: **22 discriminate** (green on safe, red on
 vulnerable, one row per attack area with a failure — 4.1 SAML, 4.2
 passkey, 4.3 audit, 4.4 OIDC, 4.5 rate limit all represented), **2 are
 documented version-check gates** (informational, pass on both by design),
 **1 is a documented config-dependent gate** (pass on both by design — see
-above), **2 are documented white-box gates** (skip on both, with a cited
-reason — see their doc comments in `audit_test.go`). Zero invalid ("passes
-both" outside a documented gate) tests remain.
+above), **10 are documented `internal/authenticator` self-tests** (pass on
+both by design — they verify that package's own WebAuthn encoding/signing
+against an in-process go-webauthn relying party, not this suite's two
+reference stubs), **2 are documented white-box gates** (skip on both, with
+a cited reason — see their doc comments in `audit_test.go`). Zero invalid
+("passes both" outside a documented gate) tests remain.
 
 ### A real coverage gap found by review and fixed
 

@@ -228,6 +228,22 @@ while IFS= read -r name; do
 			ok=0
 		fi
 		;;
+	*_SelfTest)
+		# Expected: informational, PASS on both — a self-test of
+		# internal/authenticator's own encoding/signing correctness
+		# (verified against a real, in-process go-webauthn/webauthn
+		# relying party the test itself constructs; see
+		# authenticator_test.go), not a black-box discrimination case
+		# against reference/safe vs reference/vulnerable. It never talks
+		# to SECTEST_BASE_URL at all, so it is expected to behave
+		# identically regardless of which stub this run points at.
+		if [[ "$s" == "PASS" && "$v" == "PASS" ]]; then
+			verdict="gate (authenticator package self-test, by design)"
+		else
+			verdict="INVALID — expected PASS/PASS for a *_SelfTest case, got $s/$v"
+			ok=0
+		fi
+		;;
 	*)
 		if [[ "$s" == "PASS" && "$v" == "FAIL" ]]; then
 			verdict="yes — discriminates"
