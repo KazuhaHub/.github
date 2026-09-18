@@ -108,9 +108,9 @@ owner closed those 9 by hand.
   triaged.
 - **`authcore#11`** — ADR 0003, proposing to remove `ratelimit` and extract `clientip`. **Proposed,
   not decided.**
-- **`§6` has moved, and is worth re-reading.** Four of its nine items are now closed, with the
+- **`§6` has moved, and is worth re-reading.** Five of its nine items are now closed, with the
   evidence below. The rest still stand as written — in particular **no Docker build has been run**
-  (there is still no Docker on the machine), so §6.1, §6.2 and §6.4 are untouched.
+  (there is still no Docker on the machine), so §6.1 and §6.2 are untouched.
 
   **Closed since this section was written:**
 
@@ -140,6 +140,10 @@ owner closed those 9 by hand.
     deliberately allowing `10/8`, `172.16/12` and `192.168/16`.
   - **§6.7 — jsdom 30 × vitest 5.** No longer "never run": `#116` and `#111` put that combination on
     `main` and the web job runs it on every push.
+  - **§6.4 — the web units on the Node version CI uses.** Run on Node 24.21.0 — fetched into a
+    temporary directory and put on `PATH` for one run, so nothing was installed system-wide — the
+    suite is 534 passed, 1 skipped, the same result Node 26 gives locally. Two Node majors apart and
+    no difference, which is the answer the item was asking for.
 
   **§6.9** is also worth noting as resolved-in-passing: the `sqlite (full suite, race)` failure
   recorded there as "reproduced locally, not observed in CI" has since been seen in CI and is the
