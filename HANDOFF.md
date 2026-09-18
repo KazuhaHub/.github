@@ -108,11 +108,42 @@ owner closed those 9 by hand.
   triaged.
 - **`authcore#11`** — ADR 0003, proposing to remove `ratelimit` and extract `clientip`. **Proposed,
   not decided.**
-- **`§6` is still the list of what is not verified.** Nothing in this section changes it. In
-  particular no Docker build was run, no passkey ceremony was performed end to end, and no signed
-  SAML assertion was exercised — `#102` and `#113` are now both on `main`, so the manual
-  *register → passwordless login → passkey second factor* pass §6.5 asks for is now possible and has
-  still not been done.
+- **`§6` has moved, and is worth re-reading.** Four of its nine items are now closed, with the
+  evidence below. The rest still stand as written — in particular **no Docker build has been run**
+  (there is still no Docker on the machine), so §6.1, §6.2 and §6.4 are untouched.
+
+  **Closed since this section was written:**
+
+  - **§6.5 — passkey, both halves.** Two tests, in two repositories.
+    `security-test-suite/psp_e2e_test.go` drives a real panel with the suite's Go software
+    authenticator: register → passwordless login → passkey as a second factor. That rules out the
+    *server* being broken but not the browser, because the bytes it sends are built by Go. So
+    `web-react/src/test/passkeyBrowserE2E.test.ts` runs the **real** `@simplewebauthn/browser@14` —
+    the version `#113` moved the panel to — against a real panel, replacing only
+    `navigator.credentials` with a software authenticator. That is the seam `#102` and `#113`
+    actually form, and the one a major bump of either package would break.
+    **And a real Chromium pass through the actual UI found a live bug neither test could**: the
+    first passkey's one-time recovery codes were minted by the server, returned exactly once, and
+    dropped by the dialog before the user ever saw them, because a parent refresh unmounted the
+    child that held them. Fixed in `#122`, with a regression test verified to fail before the fix
+    and pass after.
+  - **§6.3 — `npm run smoke:dist`.** Ran it with Playwright's Chromium via `CHROME_PATH`; it passes
+    four checks. The blocker was only ever a missing browser on the machine.
+  - **§6.6 — a signed SAML assertion.** Ran one end to end against the panel's real ACS, using
+    crewjam/saml 0.5.1's own `IdentityProvider` as the IdP — the same library the panel validates
+    with, at the version `#103` adopted. Accepted: an assertion signed by that IdP logged the
+    principal in and auto-provisioned the account. Rejected: the same assertion with one byte of its
+    `SignatureValue` changed. **The caveat is the one §6.6 names** — this is not a real tenant, so
+    Entra's specific claim shapes and the NameID/UPN behaviour are still unexercised.
+    Reproducing it needs a panel and an IdP on a **private-LAN** address, not loopback: the panel
+    refuses IdP metadata from loopback, link-local and unspecified addresses as an SSRF guard, while
+    deliberately allowing `10/8`, `172.16/12` and `192.168/16`.
+  - **§6.7 — jsdom 30 × vitest 5.** No longer "never run": `#116` and `#111` put that combination on
+    `main` and the web job runs it on every push.
+
+  **§6.9** is also worth noting as resolved-in-passing: the `sqlite (full suite, race)` failure
+  recorded there as "reproduced locally, not observed in CI" has since been seen in CI and is the
+  same known flake as §9.1.
 
 ---
 
