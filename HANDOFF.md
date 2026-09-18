@@ -108,9 +108,15 @@ owner closed those 9 by hand.
   triaged.
 - **`authcore#11`** — ADR 0003, proposing to remove `ratelimit` and extract `clientip`. **Proposed,
   not decided.**
-- **`§6` has moved, and is worth re-reading.** Five of its nine items are now closed, with the
-  evidence below. The rest still stand as written — in particular **no Docker build has been run**
-  (there is still no Docker on the machine), so §6.1 and §6.2 are untouched.
+- **`§6` is closed. All nine of its items are now run, with the evidence below.** That section said
+  "do not read these as passing"; every one of them now has been, except where the item itself was
+  a note rather than a check (§6.8 and §6.9, both resolved in passing and marked as such).
+
+  **What closed it, and why it took a second pass:** the last two needed a Linux machine. They were
+  run in a throwaway [Lima](https://lima-vm.io) VM — `limactl start --name=psp-build
+  template://docker`, which the host's existing Lima install already supported. That is worth
+  recording, because it is the general answer for this repository's next Docker-shaped question,
+  and because it costs nothing to keep: no Docker Desktop, no licence, no system-wide install.
 
   **Closed since this section was written:**
 
@@ -144,10 +150,24 @@ owner closed those 9 by hand.
     temporary directory and put on `PATH` for one run, so nothing was installed system-wide — the
     suite is 534 passed, 1 skipped, the same result Node 26 gives locally. Two Node majors apart and
     no difference, which is the answer the item was asking for.
+  - **§6.1 — `docker build`.** Both Dockerfiles, in the VM. `Dockerfile` builds from source and the
+    image serves: `/` and `/api/auth/methods` both 200. The in-Dockerfile gate this section reasoned
+    about from source rather than executing — `test "$(go env GOVERSION)" = "$(awk '$1 ==
+    "toolchain" { print $2 }' go.mod)"` — **passes**, which is the Go 1.27.1 adoption from `#100`
+    holding under `GOTOOLCHAIN=local`. `Dockerfile.release` is a packaging step that needs a
+    pre-built binary, so it was exercised the way the release workflow exercises it: cross-compile
+    with `golang:1.27.1-alpine3.24` (gate passes there too), then package, then run — `/` 200 with
+    the SPA entry in the served `index.html`.
+  - **§6.2 — musl/linux rolldown bindings.** The item's own wording was the gap: they "resolve in
+    the lock" but had never been *executed*. Inside `node:24-alpine`: `npm ci` succeeds, the
+    musl-specific package `@rolldown/binding-linux-arm64-musl` is present, **`require()` of it
+    succeeds**, and `vite build` completes. That is the binding running on musl, not merely
+    resolving.
 
-  **§6.9** is also worth noting as resolved-in-passing: the `sqlite (full suite, race)` failure
-  recorded there as "reproduced locally, not observed in CI" has since been seen in CI and is the
-  same known flake as §9.1.
+  **§6.8 and §6.9** were notes rather than checks, and both are resolved. §6.8 recorded that
+  `#111`/`#112` were measured at 5.0.1 rather than the 5.0.0 in their titles — that is the version
+  on `main`. §6.9 recorded the `sqlite (full suite, race)` failure as "reproduced locally, not
+  observed in CI"; it has since been seen in CI and is the same known flake as §9.1.
 
 ---
 
@@ -375,6 +395,11 @@ Narrow, not remotely reachable, one keyword to close.
 ---
 
 ## 6. What was NOT verified — do not read these as passing
+
+> **Update: every item below has since been run.** The list is kept as written, because what it says
+> about each item is still the accurate description of why it went unverified at the time. See §0 for
+> what closed each one and the evidence. Read this section for the *shape* of the gaps — they are the
+> kind that a green build does not cover — not for its current status.
 
 1. **`docker build` was never run.** No Docker on the machine. #99/#100 image existence was checked
    through the Docker Hub API; the in-Dockerfile guard failures are reasoned from source and
