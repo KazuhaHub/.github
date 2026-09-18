@@ -9,7 +9,112 @@ things that were **not** verified. Read §1 and §3 before touching anything.
 
 ---
 
-## 1. Decisions already made — do not re-litigate these
+## 0. Status after the merge session (added later on 2026‑09‑17)
+
+Everything below this section is the **original handoff, kept unedited as the record of what was
+true when it was written.** This section says what has since changed. Where the two disagree, this
+one is newer.
+
+### The batch was merged
+
+All seven "open and green" PRs, the whole triaged PSP Dependabot batch, the AlertHub batch,
+`authcore#1`/`#2`, and the handoff PR itself are on `main`. All four repositories' `main` builds are
+green. Nothing was force-merged, and no required check was bypassed.
+
+- **Report-Portal** — `#12`, `#13`, `#14`, `#15`.
+- **AlertHub** — `#18` (the security fix), `#9`, `#12`, `#10`, `#11`, `#13` (actions), `#8`, `#6`,
+  `#7`, `#16` (Go/npm deps), `#17`, `#14` (web-admin).
+- **Passwall-Sub-Panel** — `#117`, `#106`, `#107`, `#103`, `#104`, `#105`, `#100`, `#102`, `#108`,
+  `#109`, `#110`, `#114`, `#116`, `#113`, `#111`, `#115`, plus `#119`.
+- **authcore** — `#10`, `#1`, `#2`; `v0.1.0` is tagged.
+- `KazuhaHub/.github#3` — this document.
+
+### §3.1's documented path was not executable, and the pair was landed a better way
+
+§3.1 says to merge `#111` and then let Dependabot rebase `#112`. That path cannot be walked through
+branch protection: **each half fails its own `web` job**, because `#111` bumps only `vitest` and
+`#112` only `@vitest/coverage-v8`, and each leaves the other's exact peer pin unsatisfied. Merging
+either one first would have meant force-merging a red PR.
+
+Instead the coverage bump was carried **into `#111`**, making the change atomic. `npm` then resolves
+both to 5.0.1 in one step, `npm ci` succeeds, and Dependabot closed `#112` on its own as
+"up-to-date now". **`main` never sat in the red state §3.1 predicted.** Verified locally before
+pushing: `npm ci`, `npm run build`, and 533/533 vitest across 51 files.
+
+One knock-on effect §3.1 did not record: the `Docker source and release runtime baselines` job also
+fails on `#111`/`#112`, because the Dockerfile builds the web bundle. So constraint 1 reddens **two**
+required checks, not one.
+
+### `#115` landed, with a prerequisite it needed first
+
+`§4.3` was right that the three generated files had to be untracked first, and that `"types":
+["node"]` was needed. Both are done: `#119` untracked
+`web-react/vite.config.{js,d.ts}` and `tsconfig.node.tsbuildinfo` (verified nothing referenced them,
+and that a build regenerates all three and leaves the tree clean), then `#115` added
+`"types": ["node"]`. Confirmed by reproducing the 9 `capabilities.test.ts` errors first, then
+watching them clear.
+
+**Still not done, and §4.3 is right to flag it:** `"types": ["node"]` puts Node globals in scope for
+browser code, so a stray `process.env` in a component now typechecks and fails at runtime. The clean
+shape is a separate tsconfig for `*.test.ts(x)`. Also still open: the PR widens the range to
+`^7.0.2`, so future 7.x minors are accepted automatically — consider pinning.
+
+### `#101` and `#112` were closed by Dependabot, correctly
+
+Both groups became redundant once their members landed individually. `#101`'s updates are visibly
+present in `main`'s `go.mod` (`x/crypto 0.57.0`, `x/text 0.42.0`, `oidc 3.21.0`, `webauthn 0.18.1`,
+`saml 0.5.1`). Nothing was lost.
+
+### Two things that needed a code change the original plan did not name
+
+- **AlertHub `#14` and `#17` were not mergeable as bumps.** `server/internal/webadmin/dist/index.html`
+  is committed while `dist/assets/` is gitignored, so the Go jobs embed the committed index against
+  assets CI builds fresh. Changing a runtime dependency changes the bundle, and the committed index
+  named chunks the build no longer emitted —
+  `TestCachePolicy_HashedAssetsAreImmutable` failed with `GET /admin/assets/index-BVPgLNKy.js = 404`.
+  Regenerating the index is the intended maintenance step (CI's own comment says so). Determinism was
+  checked before trusting a local build: rebuilding `main` on Node 26/darwin-arm64 reproduced the
+  committed `index.html`, `favicon.svg` and `icons.svg` **byte for byte**, so a local regeneration is
+  CI's output on Node 22/linux-x64.
+- **`authcore#1`/`#2` were red on a stale base**, not on the action bumps: both failed the same
+  `captcha` test they do not touch, inherited from the initial commit. A rebase fixed both. The
+  verdict recorded in the first triage was right.
+
+### The Report-Portal commit trailers were corrected by rewriting `main`
+
+Report-Portal's `CLAUDE.md` forbids `Co-Authored-By` trailers. Four commits merged that session
+carried one, inherited from PR bodies. `main` was rewritten to strip only those trailers and the
+tree came out **byte-identical** (`894bd67e…` before and after), then `main` was force-pushed with
+the ruleset and classic protection lifted for the push and restored immediately afterwards.
+
+The local clone was realigned with `git reset --hard origin/main` afterwards, because a rewritten
+base makes a plain `git pull` create a merge. **Anyone with another clone of that repository should
+re-clone or hard-reset rather than pull.**
+
+### Report-Portal now has Dependabot, and it flushed a backlog
+
+Merging `#14` added `.github/dependabot.yml` to a repository that had none, so Dependabot immediately
+opened 9 catch-up PRs (`#16`–`#24`). The config is already tuned (weekly, grouped,
+`open-pull-requests-limit: 10`), so this is a one-time backlog flush rather than an ongoing rate. The
+owner closed those 9 by hand.
+
+### Still open
+
+- **`Passwall-Sub-Panel#99`** — deferred by decision (§1) until Node 26 is LTS.
+- **`AlertHub#15`** — genuinely blocked, and it is not a mechanical fix. `npm ci` fails because
+  `i18next@26.3.1` declares `peerOptional typescript@"^5 || ^6"` and the PR installs TypeScript
+  7.0.2. It needs an i18next release that widens the range, or a deliberate decision to override.
+- **New Dependabot PRs** appeared after the batch: `Passwall-Sub-Panel#118`, `AlertHub#19`. Not
+  triaged.
+- **`authcore#11`** — ADR 0003, proposing to remove `ratelimit` and extract `clientip`. **Proposed,
+  not decided.**
+- **`§6` is still the list of what is not verified.** Nothing in this section changes it. In
+  particular no Docker build was run, no passkey ceremony was performed end to end, and no signed
+  SAML assertion was exercised — `#102` and `#113` are now both on `main`, so the manual
+  *register → passwordless login → passkey second factor* pass §6.5 asks for is now possible and has
+  still not been done.
+
+---
 
 These came from the repository owner on 2026-09-17. They are not derivable from the code.
 
